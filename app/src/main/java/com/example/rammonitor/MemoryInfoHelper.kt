@@ -5,11 +5,15 @@ import android.app.AppOpsManager
 import android.app.usage.UsageStats
 import android.app.usage.UsageStatsManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Debug
 import android.os.Process
+import android.os.SystemClock
 import java.io.BufferedReader
 import java.io.FileReader
 
@@ -20,7 +24,9 @@ data class SystemMemory(
     val availMb: Long,
     val usedMb: Long,
     val thresholdMb: Long,
-    val lowMemory: Boolean
+    val lowMemory: Boolean,
+    val cachedMb: Long = 0,
+    val freeMb: Long = 0
 )
 
 data class AppMemory(
@@ -31,13 +37,33 @@ data class AppMemory(
     val privateDirtyMb: Long,
     val foregroundMinutes: Long,
     val lastUsed: Long,
-    val isSystem: Boolean
+    val isSystem: Boolean,
+    val category: AppCategory = AppCategory.UNKNOWN
 )
 
 data class AppReport(
     val running: List<AppMemory>,
     val recent: List<AppMemory>,
-    val usageAccess: Boolean
+    val usageAccess: Boolean,
+    val totalPssMb: Long = 0,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+enum class AppCategory(val label: String) {
+    GAME("Game"),
+    SOCIAL("Sosmed"),
+    MEDIA("Media"),
+    PRODUCTIVITY("Produktivitas"),
+    SYSTEM("Sistem"),
+    UNKNOWN("Lainnya")
+}
+
+data class DeviceInfo(
+    val cpuCores: Int,
+    val uptimeMinutes: Long,
+    val batteryPercent: Int,
+    val batteryCharging: Boolean,
+    val androidVersion: String
 )
 
 object MemoryInfoHelper {
@@ -47,12 +73,15 @@ object MemoryInfoHelper {
         val info = ActivityManager.MemoryInfo()
         am.getMemoryInfo(info)
         val mb = 1024L * 1024L
+        val kernel = getMeminfo()
         return SystemMemory(
             totalMb = info.totalMem / mb,
             availMb = info.availMem / mb,
             usedMb = (info.totalMem - info.availMem) / mb,
             thresholdMb = info.threshold / mb,
-            lowMemory = info.lowMemory
+            lowMemory = info.lowMemory,
+            cachedMb = kernel["Cached"] ?: 0L,
+            freeMb = kernel["MemFree"] ?: 0L
         )
     }
 
@@ -69,10 +98,26 @@ object MemoryInfoHelper {
                     }
                 }
             }
-        } catch (_: Exception) {
-            // /proc/meminfo tidak bisa dibaca di sebagian perangkat; abaikan.
-        }
+        } catch (_: Exception) { /* abaikan */ }
         return result
+    }
+
+    fun getDeviceInfo(context: Context): DeviceInfo {
+        val cores = Runtime.getRuntime().availableProcessors()
+        val uptime = SystemClock.elapsedRealtime() / 60000L
+        val bm = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+        val battery = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+        val intent: Intent? = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val status = intent?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+        return DeviceInfo(
+            cpuCores = cores,
+            uptimeMinutes = uptime,
+            batteryPercent = battery,
+            batteryCharging = charging,
+            androidVersion = "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
+        )
     }
 
     fun collect(context: Context): AppReport {
@@ -84,9 +129,7 @@ object MemoryInfoHelper {
             val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
             val end = System.currentTimeMillis()
             usm.queryAndAggregateUsageStats(end - DAY_MS, end) ?: emptyMap()
-        } else {
-            emptyMap()
-        }
+        } else emptyMap()
 
         val processes = am.runningAppProcesses ?: emptyList()
         val pids = processes.map { it.pid }.toIntArray()
@@ -112,7 +155,12 @@ object MemoryInfoHelper {
             .map { buildApp(pm, it.packageName, -1, 0L, 0L, it) }
             .sortedByDescending { it.lastUsed }
 
-        return AppReport(running, recent, hasAccess)
+        return AppReport(
+            running = running,
+            recent = recent,
+            usageAccess = hasAccess,
+            totalPssMb = running.sumOf { it.pssMb }
+        )
     }
 
     private fun buildApp(
@@ -125,13 +173,12 @@ object MemoryInfoHelper {
     ): AppMemory {
         val appInfo: ApplicationInfo? = try {
             pm.getApplicationInfo(pkg, 0)
-        } catch (_: Exception) {
-            null
-        }
+        } catch (_: Exception) { null }
         val label = appInfo?.loadLabel(pm)?.toString() ?: pkg
         val isSystem = appInfo?.let {
             (it.flags and ApplicationInfo.FLAG_SYSTEM) != 0
         } ?: false
+        val category = categorize(appInfo?.category ?: -1, pkg, isSystem)
         return AppMemory(
             label = label,
             packageName = pkg,
@@ -140,8 +187,27 @@ object MemoryInfoHelper {
             privateDirtyMb = dirtyKb / 1024L,
             foregroundMinutes = (stats?.totalTimeInForeground ?: 0L) / 60000L,
             lastUsed = stats?.lastTimeUsed ?: System.currentTimeMillis(),
-            isSystem = isSystem
+            isSystem = isSystem,
+            category = category
         )
+    }
+
+    private fun categorize(apiCategory: Int, pkg: String, isSystem: Boolean): AppCategory {
+        if (isSystem) return AppCategory.SYSTEM
+        return when {
+            pkg.contains("game") -> AppCategory.GAME
+            pkg.contains("social") || pkg.contains("facebook") ||
+                    pkg.contains("instagram") || pkg.contains("twitter") ||
+                    pkg.contains("tiktok") || pkg.contains("whatsapp") -> AppCategory.SOCIAL
+            pkg.contains("video") || pkg.contains("music") ||
+                    pkg.contains("youtube") || pkg.contains("spotify") -> AppCategory.MEDIA
+            apiCategory == ApplicationInfo.CATEGORY_GAME -> AppCategory.GAME
+            apiCategory == ApplicationInfo.CATEGORY_VIDEO ||
+                    apiCategory == ApplicationInfo.CATEGORY_AUDIO -> AppCategory.MEDIA
+            apiCategory == ApplicationInfo.CATEGORY_PRODUCTIVITY ||
+                    apiCategory == ApplicationInfo.CATEGORY_NEWS -> AppCategory.PRODUCTIVITY
+            else -> AppCategory.UNKNOWN
+        }
     }
 
     fun hasUsageAccess(context: Context): Boolean {
