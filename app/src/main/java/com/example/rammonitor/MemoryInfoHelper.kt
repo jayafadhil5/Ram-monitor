@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Debug
 import android.os.Process
 import java.io.BufferedReader
 import java.io.FileReader
@@ -69,6 +70,7 @@ object MemoryInfoHelper {
                 }
             }
         } catch (_: Exception) {
+            // /proc/meminfo tidak bisa dibaca di sebagian perangkat; abaikan.
         }
         return result
     }
@@ -81,14 +83,15 @@ object MemoryInfoHelper {
         val usage: Map<String, UsageStats> = if (hasAccess) {
             val usm = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
             val end = System.currentTimeMillis()
-            usm.queryAndAggregateUsageStats(end - DAY_MS, end)
+            usm.queryAndAggregateUsageStats(end - DAY_MS, end) ?: emptyMap()
         } else {
             emptyMap()
         }
 
         val processes = am.runningAppProcesses ?: emptyList()
         val pids = processes.map { it.pid }.toIntArray()
-        val infos = if (pids.isNotEmpty()) am.getProcessMemoryInfo(pids) else emptyArray()
+        val infos: Array<Debug.MemoryInfo> =
+            if (pids.isNotEmpty()) am.getProcessMemoryInfo(pids) else emptyArray()
 
         val running = processes.mapIndexed { i, proc ->
             val pkg = proc.pkgList?.firstOrNull() ?: proc.processName
@@ -126,7 +129,9 @@ object MemoryInfoHelper {
             null
         }
         val label = appInfo?.loadLabel(pm)?.toString() ?: pkg
-        val isSystem = appInfo?.let { (it.flags and ApplicationInfo.FLAG_SYSTEM) != 0 } ?: false
+        val isSystem = appInfo?.let {
+            (it.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+        } ?: false
         return AppMemory(
             label = label,
             packageName = pkg,
@@ -134,7 +139,7 @@ object MemoryInfoHelper {
             pssMb = pssKb / 1024L,
             privateDirtyMb = dirtyKb / 1024L,
             foregroundMinutes = (stats?.totalTimeInForeground ?: 0L) / 60000L,
-            lastUsed = stats?.lastTimeUsed ?: 0L,
+            lastUsed = stats?.lastTimeUsed ?: System.currentTimeMillis(),
             isSystem = isSystem
         )
     }
