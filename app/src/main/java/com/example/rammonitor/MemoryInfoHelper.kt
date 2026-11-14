@@ -1,3 +1,4 @@
+
 package com.example.rammonitor
 
 import android.app.ActivityManager
